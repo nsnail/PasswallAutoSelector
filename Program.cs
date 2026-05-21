@@ -408,7 +408,8 @@ static async Task<bool> ClickByKeywordsAsync(IPage page, IReadOnlyList<string> k
 static async Task<NodeResult?> WaitForBestNodeAsync(IPage page, AppConfig config, CancellationToken ct)
 {
     var deadline = DateTimeOffset.Now.AddSeconds(config.TestResultTimeoutSeconds);
-    NodeResult? previousBest = null;
+    NodeResult? previousFastest = null;
+    List<NodeResult>? latestPassed = null;
     var stableRounds = 0;
 
     while (DateTimeOffset.Now < deadline)
@@ -418,12 +419,14 @@ static async Task<NodeResult?> WaitForBestNodeAsync(IPage page, AppConfig config
 
         if (passed.Count > 0)
         {
-            var best = passed[0];
-            Log($"候选最优: {best.Name} | Ping={FormatMs(best.PingMs)} TCP={FormatMs(best.TcpMs)} URL={FormatMs(best.UrlMs)}");
+            latestPassed = passed;
+            var fastest = passed[0];
+            var picked = PickNodeWithRandomFactor(passed, config);
+            Log($"候选最优(速度): {fastest.Name} | 随机候选: {picked.Name} | Ping={FormatMs(picked.PingMs)} TCP={FormatMs(picked.TcpMs)} URL={FormatMs(picked.UrlMs)} BaseScore={picked.Score:F2} EffectiveScore={picked.EffectiveScore:F2}");
 
-            if (previousBest is not null &&
-                string.Equals(previousBest.Name, best.Name, StringComparison.OrdinalIgnoreCase) &&
-                Math.Abs(previousBest.Score - best.Score) < 0.1)
+            if (previousFastest is not null &&
+                string.Equals(previousFastest.Name, fastest.Name, StringComparison.OrdinalIgnoreCase) &&
+                Math.Abs(previousFastest.Score - fastest.Score) < 0.1)
             {
                 stableRounds++;
             }
@@ -432,10 +435,10 @@ static async Task<NodeResult?> WaitForBestNodeAsync(IPage page, AppConfig config
                 stableRounds = 1;
             }
 
-            previousBest = best;
+            previousFastest = fastest;
             if (stableRounds >= config.StableRoundsRequired)
             {
-                return best;
+                return PickNodeWithRandomFactor(passed, config);
             }
         }
         else
@@ -454,7 +457,43 @@ static async Task<NodeResult?> WaitForBestNodeAsync(IPage page, AppConfig config
         await Task.Delay(TimeSpan.FromSeconds(config.PollIntervalSeconds), ct);
     }
 
-    return previousBest;
+    if (latestPassed is { Count: > 0 })
+    {
+        return PickNodeWithRandomFactor(latestPassed, config);
+    }
+
+    return previousFastest;
+}
+
+static NodeResult PickNodeWithRandomFactor(IReadOnlyList<NodeResult> passed, AppConfig config)
+{
+    if (passed.Count == 0)
+    {
+        throw new InvalidOperationException("没有可用节点可供选择。");
+    }
+
+    if (config.RandomFactorMs <= 0)
+    {
+        var fastest = passed[0];
+        fastest.EffectiveScore = fastest.Score;
+        return fastest;
+    }
+
+    NodeResult? selected = null;
+    var bestEffectiveScore = double.MaxValue;
+
+    foreach (var node in passed)
+    {
+        var effectiveScore = node.Score + Random.Shared.NextDouble() * config.RandomFactorMs;
+        if (effectiveScore < bestEffectiveScore)
+        {
+            bestEffectiveScore = effectiveScore;
+            selected = node;
+        }
+    }
+
+    selected!.EffectiveScore = bestEffectiveScore;
+    return selected;
 }
 
 static async Task<List<NodeResult>> CollectNodeResultsAsync(IPage page, AppConfig config)
@@ -943,6 +982,7 @@ public sealed class AppConfig
     public bool UseRowLevelTest { get; set; } = true;
     public int RowTestInterClickDelayMs { get; set; } = 700;
     public int RowTestInterNodeDelayMs { get; set; } = 300;
+    public double RandomFactorMs { get; set; } = 20;
 
     public List<string> PingTriggerKeywords { get; set; } = new()
     {
@@ -1000,6 +1040,7 @@ public sealed class NodeResult
     public required string UrlRaw { get; set; }
     public required string UseSelector { get; set; }
     public double Score { get; set; }
+    public double EffectiveScore { get; set; }
     public bool AllPassed => PingOk && TcpOk && UrlOk;
 }
 
